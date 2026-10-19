@@ -246,6 +246,22 @@ async function runMigrations() {
         UNIQUE(region_id, blackout_date)
       )
     `);
+    // Upgrade to site-wide date ranges used by routes/blackout.js and the admin UI
+    await client.query(`
+      ALTER TABLE blackout_dates
+        ADD COLUMN IF NOT EXISTS start_date DATE,
+        ADD COLUMN IF NOT EXISTS end_date DATE,
+        ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT true,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ALTER COLUMN region_id DROP NOT NULL,
+        ALTER COLUMN blackout_date DROP NOT NULL
+    `);
+    await client.query(`
+      UPDATE blackout_dates
+      SET start_date = COALESCE(start_date, blackout_date),
+          end_date = COALESCE(end_date, blackout_date)
+      WHERE blackout_date IS NOT NULL AND (start_date IS NULL OR end_date IS NULL)
+    `);
     console.log('    ✅ blackout_dates table ready');
     
     // Create subscription_hds_mapping table
