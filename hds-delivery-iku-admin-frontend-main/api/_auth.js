@@ -48,7 +48,7 @@ function readCookie(req, name) {
 }
 
 function sessionCookie(value, maxAgeSeconds) {
-  const secure = process.env.VERCEL ? '; Secure' : ''
+  const secure = process.env.VERCEL || process.env.RAILWAY_ENVIRONMENT ? '; Secure' : ''
   return `${COOKIE_NAME}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${secure}`
 }
 
