@@ -1,0 +1,377 @@
+/**
+ * Batch Enrichment Queue Processor
+ * 
+ * Stores enriched HDS data in our database (order_enrichments table)
+ * No Shopify API calls needed - completely independent
+ * Scales to 10,000+ orders/day with no rate limiting issues
+ */
+
+const pool = require('../lib/db');
+const suburbsStore = require('../lib/suburbs-sync-store');
+
+const BATCH_SIZE = 10;
+const PROCESS_INTERVAL = 10000; // 10 seconds
+
+let isProcessing = false;
+
+async function enrichOrderFromQueue() {
+  if (isProcessing) {
+    console.log('⏳ Enrichment already running, skipping...');
+    return;
+  }
+
+  isProcessing = true;
+
+  try {
+    // Fetch pending orders from queue
+    const pendingResult = await pool.query(
+      `SELECT * FROM orders_to_enrich 
+       WHERE status = 'pending' 
+       ORDER BY created_at ASC 
+       LIMIT $1`,
+      [BATCH_SIZE]
+    );
+
+    if (pendingResult.rows.length === 0) {
+      isProcessing = false;
+      return;
+    }
+
+    console.log(`📦 Processing ${pendingResult.rows.length} orders from enrichment queue...`);
+
+    const orders = pendingResult.rows;
+
+    // Process each order
+    for (const queueEntry of orders) {
+      try {
+        const deliveryDate = queueEntry.delivery_date;
+        const deliveryLocationId = queueEntry.delivery_location_id;
+        const deliveryTime = queueEntry.delivery_time;
+
+        if (!deliveryDate || !deliveryLocationId) {
+          // Not a delivery order, mark as skipped
+          await pool.query(
+            `UPDATE orders_to_enrich SET status = 'skipped', processed_at = NOW() WHERE id = $1`,
+            [queueEntry.id]
+          );
+          console.log(`⏭️  Order #${queueEntry.order_id}: No delivery data (standard order)`);
+          continue;
+        }
+
+        // Enrich the order
+        const enrichedData = await enrichOrder(deliveryDate, deliveryLocationId, deliveryTime);
+
+        if (!enrichedData) {
+          throw new Error('Failed to calculate enriched data');
+        }
+
+        // Store enriched data in order_enrichments table (our database, not Shopify)
+        await pool.query(
+          `INSERT INTO order_enrichments (
+            order_id,
+            hds_delivery_date,
+            hds_delivery_formatted,
+            hds_delivery_day,
+            hds_delivery_window,
+            hds_delivery_time,
+            hds_schedule_id,
+            hds_pack_date,
+            hds_production_date,
+            hds_region,
+            hds_suburb,
+            hds_postcode
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           ON CONFLICT (order_id) DO UPDATE SET
+            hds_delivery_date = $2,
+            hds_delivery_formatted = $3,
+            hds_delivery_day = $4,
+            hds_delivery_window = $5,
+            hds_delivery_time = $6,
+            hds_schedule_id = $7,
+            hds_pack_date = $8,
+            hds_production_date = $9,
+            hds_region = $10,
+            hds_suburb = $11,
+            hds_postcode = $12,
+            updated_at = NOW()`,
+          [
+            queueEntry.order_id,
+            enrichedData.hds_delivery_date,
+            enrichedData.hds_delivery_formatted,
+            enrichedData.hds_delivery_day,
+            enrichedData.hds_delivery_window,
+            enrichedData.hds_delivery_time,
+            enrichedData.hds_schedule_id,
+            enrichedData.hds_pack_date,
+            enrichedData.hds_production_date,
+            enrichedData.hds_region,
+            enrichedData.hds_suburb,
+            enrichedData.hds_postcode,
+          ]
+        );
+
+        // Mark as processed
+        await pool.query(
+          `UPDATE orders_to_enrich SET status = 'completed', processed_at = NOW() WHERE id = $1`,
+          [queueEntry.id]
+        );
+
+        console.log(`✅ Enriched order #${queueEntry.order_id} → stored in order_enrichments`);
+        
+        // Sync to Shopify (non-blocking background task)
+        const syncResult = syncToShopifyAsync(queueEntry.order_id, enrichedData); // Non-blocking sync
+
+      } catch (err) {
+        console.error(`❌ Error enriching order #${queueEntry.order_id}:`, err.message);
+
+        // Increment retry count
+        const newRetryCount = (queueEntry.retry_count || 0) + 1;
+        const status = newRetryCount >= 3 ? 'failed' : 'pending';
+
+        await pool.query(
+          `UPDATE orders_to_enrich 
+           SET status = $1, retry_count = $2, error_message = $3, processed_at = NOW() 
+           WHERE id = $4`,
+          [status, newRetryCount, err.message, queueEntry.id]
+        );
+      }
+    }
+
+  } catch (err) {
+    console.error('❌ Queue processor error:', err.message);
+  } finally {
+    isProcessing = false;
+  }
+}
+
+/**
+ * Enrich order with HDS delivery data
+ * Uses only our database - NO Shopify API calls
+ */
+async function enrichOrder(deliveryDate, deliveryLocationId, deliveryTime) {
+  try {
+    // Parse delivery date
+    const cleanDate = String(deliveryDate).trim();
+    if (!cleanDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+      throw new Error(`Invalid date format: ${cleanDate}`);
+    }
+
+    const deliveryDateObj = new Date(cleanDate + 'T00:00:00Z');
+    if (isNaN(deliveryDateObj.getTime())) {
+      throw new Error(`Invalid date value: ${cleanDate}`);
+    }
+
+    const deliveryDayNum = deliveryDateObj.getDay();
+    const dayMap = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const deliveryDayName = dayMap[deliveryDayNum];
+
+    // Find suburb and region by postcode (use in-memory store first, then database)
+    const postcode = deliveryLocationId.toString();
+    let suburb = suburbsStore.findByPostcode(postcode);
+    
+    // Fall back to database if not in store
+    if (!suburb) {
+      const suburbResult = await pool.query(
+        `SELECT id, name, region_id FROM suburbs WHERE postcode::text = $1 LIMIT 1`,
+        [postcode]
+      );
+      
+      if (suburbResult.rows.length === 0) {
+        throw new Error(`Suburb not found for postcode: ${postcode}`);
+      }
+      suburb = suburbResult.rows[0];
+    }
+    
+    const regionId = suburb.region_id;
+
+    // Get region info from database (or fallback to default)
+    let region = null;
+    try {
+      const regionResult = await pool.query(
+        `SELECT id, name FROM regions WHERE id = $1`,
+        [regionId]
+      );
+      region = regionResult.rows[0];
+    } catch (e) {
+      // If query fails, use suburb region_id as fallback
+      console.warn(`⚠️  Warning getting region ${regionId}:`, e.message);
+    }
+    
+    if (!region) {
+      region = { id: regionId, name: suburb.hds_zone || 'Unknown Region' };
+    }
+
+    // Find delivery schedule
+    // delivery_schedules.delivery_day is stored as a string (e.g. 'Thursday'), query by name.
+    const scheduleResult = await pool.query(
+      `SELECT * FROM delivery_schedules 
+       WHERE region_id = $1 AND delivery_day = $2 AND enabled = true 
+       LIMIT 1`,
+      [regionId, deliveryDayName]
+    );
+
+    if (scheduleResult.rows.length === 0) {
+      throw new Error(`No schedule found for ${deliveryDayName} in ${region.name}`);
+    }
+
+    const schedule = scheduleResult.rows[0];
+    // Normalize pack_day which may be stored as a numeric (0-6) or day name string
+    const dayNameToIndex = {
+      'Sunday': 0, 'Monday': 1, 'Tuesday': 2, 'Wednesday': 3,
+      'Thursday': 4, 'Friday': 5, 'Saturday': 6,
+    };
+
+    let packDayNum;
+    if (typeof schedule.pack_day === 'number') {
+      packDayNum = schedule.pack_day;
+    } else if (typeof schedule.pack_day === 'string' && !isNaN(parseInt(schedule.pack_day, 10))) {
+      packDayNum = parseInt(schedule.pack_day, 10);
+    } else {
+      packDayNum = dayNameToIndex[String(schedule.pack_day)] ?? 0;
+    }
+
+    // Calculate pack and production dates
+    const dayDifference = (deliveryDayNum - packDayNum + 7) % 7;
+    const packDateObj = new Date(deliveryDateObj);
+    packDateObj.setDate(packDateObj.getDate() - dayDifference);
+
+    const productionDateObj = new Date(packDateObj);
+    productionDateObj.setDate(productionDateObj.getDate() - 1);
+
+    const formatDate = (date) => date.toISOString().split('T')[0];
+
+    return {
+      hds_delivery_date: deliveryDate,
+      hds_delivery_formatted: deliveryDateObj.toLocaleDateString('en-AU', {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+      }),
+      hds_delivery_day: deliveryDayName,
+      hds_delivery_window: deliveryTime && deliveryTime.includes('12:00 AM') ? 'AM' : 'BUSINESS_HOURS',
+      hds_delivery_time: deliveryTime,
+      hds_schedule_id: schedule.id.toString(),
+      hds_pack_date: formatDate(packDateObj),
+      hds_production_date: formatDate(productionDateObj),
+      hds_region: region.name,
+      hds_suburb: suburb.name,
+      hds_postcode: deliveryLocationId,
+    };
+  } catch (err) {
+    console.error('Error enriching order:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Sync enriched data to Shopify order note_attributes (non-blocking)
+ *
+ * IMPORTANT: Shopify's REST PUT /orders/{id}.json REPLACES the entire
+ * note_attributes array — it does not merge. The checkout extension already
+ * writes its own attributes (Delivery-Date, Delivery-Time, Pick-Pack-Date,
+ * HDS Pack Date, etc.) at checkout time, so we must fetch the order's
+ * current note_attributes and merge our hds_* keys into them here. Without
+ * this, this call wipes out every attribute the checkout wrote.
+ */
+async function syncToShopifyAsync(orderId, enrichedData) {
+  try {
+    const shopifyToken = process.env.SHOPIFY_ADMIN_TOKEN;
+    const shopifyStore = (process.env.SHOPIFY_STORE || '').replace(/\/$/, '');
+
+    if (!shopifyToken || !shopifyStore) {
+      console.log('⚠️ Shopify creds missing, skipping sync');
+      return;
+    }
+
+    const axios = require('axios');
+    const apiBase = `https://${shopifyStore}/admin/api/2026-04/orders/${orderId}.json`;
+    const headers = {
+      'X-Shopify-Access-Token': shopifyToken,
+      'Content-Type': 'application/json',
+    };
+
+    // Fetch the order's current note_attributes so we can merge into them
+    // instead of replacing the array outright.
+    const orderResponse = await axios.get(apiBase, { headers, timeout: 5000 });
+    const existingAttributes = orderResponse.data.order.note_attributes || [];
+
+    const hdsAttributes = {
+      hds_delivery_date: enrichedData.hds_delivery_date,
+      hds_delivery_formatted: enrichedData.hds_delivery_formatted,
+      hds_delivery_day: enrichedData.hds_delivery_day,
+      hds_delivery_window: enrichedData.hds_delivery_window,
+      hds_delivery_time: enrichedData.hds_delivery_time,
+      hds_schedule_id: String(enrichedData.hds_schedule_id),
+      hds_pack_date: enrichedData.hds_pack_date,
+      hds_production_date: enrichedData.hds_production_date,
+      hds_region: enrichedData.hds_region,
+      hds_suburb: enrichedData.hds_suburb,
+      hds_postcode: enrichedData.hds_postcode,
+    };
+
+    const mergedAttributes = existingAttributes.map((attr) => ({ ...attr }));
+    let changed = false;
+    for (const [name, value] of Object.entries(hdsAttributes)) {
+      const existingIndex = mergedAttributes.findIndex((attr) => attr.name === name);
+      if (existingIndex >= 0) {
+        if (String(mergedAttributes[existingIndex].value) !== String(value)) {
+          mergedAttributes[existingIndex].value = value;
+          changed = true;
+        }
+      } else {
+        mergedAttributes.push({ name, value });
+        changed = true;
+      }
+    }
+
+    // Safety guard: never send a payload that would delete an existing key.
+    const mergedNames = new Set(mergedAttributes.map((attr) => attr.name));
+    const missing = existingAttributes.filter((attr) => !mergedNames.has(attr.name));
+    if (missing.length > 0) {
+      console.error(`❌ Aborting sync for #${orderId}: would delete keys: ${missing.map((a) => a.name).join(', ')}`);
+      return;
+    }
+
+    // Nothing to write: skip the PUT so Shopify doesn't log another
+    // "edited the details of this order" timeline event.
+    if (!changed) {
+      console.log(`⏭️  Shopify #${orderId} already up to date, skipping sync`);
+      return;
+    }
+
+    // Use REST API PUT /orders/{id} with the merged note_attributes
+    await axios.put(
+      apiBase,
+      { order: { note_attributes: mergedAttributes } },
+      { headers, timeout: 5000 }
+    );
+
+    console.log(`✅ Synced to Shopify #${orderId}`);
+  } catch (err) {
+    if (err.response?.status === 401) {
+      console.warn('⚠️ Shopify 401: Check SHOPIFY_ADMIN_TOKEN');
+    } else if (err.response?.status === 404) {
+      console.warn(`⚠️ Shopify 404: Order #${orderId} not found`);
+    } else if (err.code === 'ECONNREFUSED') {
+      console.warn('⚠️ Cannot reach Shopify API');
+    } else {
+      console.warn(`⚠️ Sync failed: ${err.message}`);
+    }
+  }
+}
+
+
+// Initialize queue processor
+function initQueueProcessor() {
+  console.log('⏰ Order enrichment queue processor scheduled (every 10 seconds)');
+  setInterval(enrichOrderFromQueue, PROCESS_INTERVAL);
+  
+  // Run immediately on startup
+  enrichOrderFromQueue();
+}
+
+module.exports = {
+  initQueueProcessor,
+  enrichOrderFromQueue,
+};

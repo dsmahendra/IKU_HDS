@@ -1,0 +1,525 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const pool = require('./lib/db');
+const hdsSync = require('./jobs/hds-sync');
+const queueProcessor = require('./jobs/enrich-orders-queue');
+
+const store = require('./lib/memory-store');
+const suburbsStore = require('./lib/suburbs-sync-store');
+const hdsSuburbsSync = require('./jobs/hds-sync-suburbs');
+const { addDeliveryColumns } = require('./migrations/add-delivery-columns');
+const { addCasulaSuburb } = require('./migrations/add-casula-suburb');
+const { addCentralCoastRegion } = require('./migrations/add-central-coast-region');
+const regionsRouter = require('./routes/regions');
+const suburbsRouter = require('./routes/suburbs');
+const schedulesRouter = require('./routes/schedules');
+const schedulesCrudRouter = require('./routes/schedules-crud');
+const subscriptionsRouter = require('./routes/subscriptions');
+const syncRouter = require('./routes/sync');
+const blackoutRouter = require('./routes/blackout');
+const publicRouter = require('./routes/public');
+const webhooksRouter = require('./routes/webhooks');
+const enrichmentsRouter = require('./routes/enrichments');
+const debugRouter = require('./routes/debug');
+const envDebugRouter = require('./routes/env-debug');
+const connectionTestRouter = require('./routes/connection-test');
+const authRouter = require('./routes/auth');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Middleware
+// CORS enabled for API routes (except auth which uses redirects)
+app.use((req, res, next) => {
+  // Allow CORS for API routes except auth
+  if (!req.path.startsWith('/api/auth')) {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  next();
+});
+
+// Explicit CORS headers for checkout integration
+// Skip CORS middleware for auth routes (they need redirects)
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/auth')) return next();
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// Parse JSON with raw body capture for webhook signature verification
+app.use(bodyParser.json({
+  verify: (req, res, buf, encoding) => {
+    req.rawBody = buf.toString(encoding || 'utf8');
+  }
+}));
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// Cookie middleware for OAuth state
+const cookieParser = require('cookie-parser');
+app.use(cookieParser());
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Debug routes
+app.use('/debug', debugRouter);
+app.use('/env-debug', envDebugRouter);
+app.use('/connection-test', connectionTestRouter);
+
+// NOTE: All /api/public/delivery-options requests are now handled by publicRouter below.
+// Removed hardcoded endpoint to use dynamic suburbs-sync-store and delivery_schedules from database.
+
+// GET /api/schedules is now handled by schedulesCrudRouter above
+
+// Auth routes (Shopify OAuth) - MUST be before CORS restrictions
+app.use('/api/auth', authRouter);
+
+// Use real CRUD routes for schedules (in-memory store only)
+app.use('/api/schedules', schedulesCrudRouter);
+
+// Webhooks (Shopify + Loop integration - no auth required, signature verified)
+app.use('/webhooks', webhooksRouter);
+
+// API Routes
+app.use('/api/regions', regionsRouter);
+app.use('/api/suburbs', suburbsRouter);
+app.use('/api/subscriptions', subscriptionsRouter);
+// NOTE: schedulesRouter removed - it requires PostgreSQL which is not available
+// All schedule operations use in-memory store via schedulesCrudRouter above
+app.use('/api/sync', syncRouter);
+app.use('/api/blackout-dates', blackoutRouter);
+
+// Public API Routes (for checkout)
+app.use('/api/public', publicRouter);
+
+// Enrichment API Routes
+app.use('/api/enrichments', enrichmentsRouter);
+
+// Error handling
+app.use((err, req, res, next) => {
+  console.error('Error:', err.message);
+  res.status(err.status || 500).json({
+    error: err.message,
+    status: err.status || 500,
+  });
+});
+
+// 404
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+// Run migrations on startup
+async function runMigrations() {
+  const client = await pool.connect();
+  
+  try {
+    console.log('🔧 Running database migrations...');
+    
+    // Create regions table
+    console.log('  Creating regions table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS regions (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        code VARCHAR(10),
+        hds_zone VARCHAR(255),
+        location VARCHAR(255),
+        cutoff_time VARCHAR(10),
+        enabled BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('    ✅ regions table ready');
+    
+    // Add hds_zone column if it doesn't exist
+    try {
+      await client.query(`ALTER TABLE regions ADD COLUMN hds_zone VARCHAR(255)`);
+      console.log('    ✅ Added hds_zone column to regions');
+    } catch (e) {
+      if (e.code !== '42701') throw e; // 42701 = column already exists
+    }
+    
+    // Add missing columns to regions if they don't exist
+    console.log('  Checking for missing columns in regions...');
+    try {
+      await client.query(`ALTER TABLE regions ADD COLUMN location VARCHAR(255)`);
+      console.log('    ✅ Added location column to regions');
+    } catch (e) {
+      if (e.code !== '42701') throw e;
+    }
+    try {
+      await client.query(`ALTER TABLE regions ADD COLUMN cutoff_time VARCHAR(10)`);
+      console.log('    ✅ Added cutoff_time column to regions');
+    } catch (e) {
+      if (e.code !== '42701') throw e;
+    }
+    try {
+      await client.query(`ALTER TABLE regions ADD COLUMN enabled BOOLEAN DEFAULT true`);
+      console.log('    ✅ Added enabled column to regions');
+    } catch (e) {
+      if (e.code !== '42701') throw e;
+    }
+    try {
+      await client.query(`ALTER TABLE regions ADD COLUMN delivery_hours VARCHAR(100)`);
+      console.log('    ✅ Added delivery_hours column to regions');
+    } catch (e) {
+      if (e.code !== '42701') throw e;
+    }
+    
+    // Create suburbs table
+    console.log('  Creating suburbs table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS suburbs (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        postcode VARCHAR(10) NOT NULL,
+        state VARCHAR(10),
+        region_id INTEGER REFERENCES regions(id),
+        serviceable BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(name, postcode, state)
+      )
+    `);
+    console.log('    ✅ suburbs table ready');
+    
+    // Create delivery_schedules table
+    console.log('  Creating delivery_schedules table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS delivery_schedules (
+        id SERIAL PRIMARY KEY,
+        region_id INTEGER NOT NULL REFERENCES regions(id),
+        cutoff_day INTEGER,
+        pack_day INTEGER,
+        delivery_day INTEGER,
+        hours VARCHAR(255),
+        enabled BOOLEAN DEFAULT true,
+        is_default BOOLEAN DEFAULT false,
+        location VARCHAR(255),
+        has_am BOOLEAN DEFAULT false,
+        has_business_hours BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('    ✅ delivery_schedules table ready');
+    
+    // Add missing columns if they don't exist
+    console.log('  Checking for missing columns in delivery_schedules...');
+    try {
+      await client.query(`ALTER TABLE delivery_schedules ADD COLUMN location VARCHAR(255)`);
+      console.log('    ✅ Added location column');
+    } catch (e) {
+      if (e.code !== '42701') throw e; // 42701 = column already exists
+    }
+    try {
+      await client.query(`ALTER TABLE delivery_schedules ADD COLUMN has_am BOOLEAN DEFAULT false`);
+      console.log('    ✅ Added has_am column');
+    } catch (e) {
+      if (e.code !== '42701') throw e;
+    }
+    try {
+      await client.query(`ALTER TABLE delivery_schedules ADD COLUMN has_business_hours BOOLEAN DEFAULT false`);
+      console.log('    ✅ Added has_business_hours column');
+    } catch (e) {
+      if (e.code !== '42701') throw e;
+    }
+    
+    // Create blackout_dates table
+    console.log('  Creating blackout_dates table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS blackout_dates (
+        id SERIAL PRIMARY KEY,
+        region_id INTEGER NOT NULL REFERENCES regions(id),
+        blackout_date DATE NOT NULL,
+        reason VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(region_id, blackout_date)
+      )
+    `);
+    console.log('    ✅ blackout_dates table ready');
+    
+    // Create subscription_hds_mapping table
+    console.log('  Creating subscription_hds_mapping table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS subscription_hds_mapping (
+        id SERIAL PRIMARY KEY,
+        loop_subscription_id VARCHAR NOT NULL UNIQUE,
+        hds_schedule_id INTEGER NOT NULL REFERENCES delivery_schedules(id),
+        hds_region_id INTEGER NOT NULL,
+        offset_days INTEGER NOT NULL,
+        delivery_day VARCHAR NOT NULL,
+        pack_day VARCHAR,
+        cutoff_day VARCHAR,
+        customer_id VARCHAR,
+        customer_email VARCHAR,
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('    ✅ subscription_hds_mapping table ready');
+    
+    // Create subscription_changes_log table
+    console.log('  Creating subscription_changes_log table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS subscription_changes_log (
+        id SERIAL PRIMARY KEY,
+        loop_subscription_id VARCHAR NOT NULL,
+        change_type VARCHAR NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        reason VARCHAR,
+        triggered_by VARCHAR,
+        changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('    ✅ subscription_changes_log table ready');
+    
+    // Create subscription_auto_charges table
+    console.log('  Creating subscription_auto_charges table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS subscription_auto_charges (
+        id SERIAL PRIMARY KEY,
+        loop_subscription_id VARCHAR NOT NULL,
+        loop_order_id VARCHAR,
+        shopify_order_id VARCHAR,
+        next_delivery_date DATE,
+        charge_date DATE,
+        offset_days INTEGER,
+        status VARCHAR DEFAULT 'pending',
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        processed_at TIMESTAMP
+      )
+    `);
+    console.log('    ✅ subscription_auto_charges table ready');
+    
+    console.log('✅ All migrations completed successfully');
+    client.release();
+  } catch (error) {
+    console.error('❌ Migration error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    client.release();
+    throw error;
+  }
+}
+
+// Seed initial data
+async function seedInitialData() {
+  const client = await pool.connect();
+  try {
+    console.log('🌱 Seeding initial data...');
+    
+    // Check if regions already exist (don't re-seed on every startup)
+    const existingRegions = await client.query('SELECT COUNT(*) as count FROM regions');
+    const regionCount = parseInt(existingRegions.rows[0].count);
+    
+    if (regionCount === 0) {
+      // Only seed if regions table is empty
+      console.log('  Inserting all 28 regions...');
+      const fs = require('fs');
+      const path = require('path');
+      const regionsSql = fs.readFileSync(path.join(__dirname, 'migrations', '001-insert-regions.sql'), 'utf-8');
+      await client.query(regionsSql);
+      console.log('    ✅ All 28 regions inserted');
+    } else {
+      console.log(`  ✅ ${regionCount} regions already exist (skipping seed)`);
+    }
+    
+    // Create orders_to_enrich queue table
+    console.log('  Creating orders_to_enrich table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS orders_to_enrich (
+        id SERIAL PRIMARY KEY,
+        order_id BIGINT NOT NULL UNIQUE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        processed_at TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'pending',
+        retry_count INT DEFAULT 0,
+        error_message TEXT
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_orders_to_enrich_status_created 
+      ON orders_to_enrich(status, created_at)
+    `);
+    console.log('    ✅ orders_to_enrich table ready');
+
+    // Add missing columns to existing tables (from previous deployments)
+    console.log('  Adding missing columns to existing tables...');
+    const deliveryColumns = [
+      ['delivery_date', 'VARCHAR(10)'],
+      ['delivery_location_id', 'VARCHAR(20)'],
+      ['delivery_time', 'VARCHAR(50)'],
+    ];
+    
+    for (const [colName, colType] of deliveryColumns) {
+      try {
+        await client.query(`ALTER TABLE orders_to_enrich ADD COLUMN \${colName} \${colType}`);
+        console.log(`    ✅ Added \${colName} to orders_to_enrich`);
+      } catch (e) {
+        if (e.code !== '42701') console.log(`    ℹ️  \${colName} already exists`);
+      }
+    }
+    
+    const enrichColumns = [
+      ['hds_delivery_date', 'VARCHAR(10)'],
+      ['hds_delivery_formatted', 'TEXT'],
+      ['hds_delivery_day', 'VARCHAR(20)'],
+      ['hds_delivery_window', 'VARCHAR(50)'],
+      ['hds_delivery_time', 'VARCHAR(50)'],
+      ['hds_schedule_id', 'VARCHAR(20)'],
+      ['hds_pack_date', 'VARCHAR(10)'],
+      ['hds_production_date', 'VARCHAR(10)'],
+      ['hds_region', 'VARCHAR(255)'],
+      ['hds_suburb', 'VARCHAR(255)'],
+      ['hds_postcode', 'VARCHAR(10)'],
+    ];
+    
+    for (const [colName, colType] of enrichColumns) {
+      try {
+        await client.query(`ALTER TABLE order_enrichments ADD COLUMN \${colName} \${colType}`);
+        console.log(`    ✅ Added \${colName} to order_enrichments`);
+      } catch (e) {
+        if (e.code !== '42701') console.log(`    ℹ️  \${colName} already exists`);
+      }
+    }
+
+
+    // Create order_enrichments table (stores enriched HDS data for all orders)
+    console.log('  Creating order_enrichments table...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_enrichments (
+        id SERIAL PRIMARY KEY,
+        order_id BIGINT NOT NULL UNIQUE,
+        hds_delivery_date VARCHAR(10),
+        hds_delivery_formatted TEXT,
+        hds_delivery_day VARCHAR(20),
+        hds_delivery_window VARCHAR(50),
+        hds_delivery_time VARCHAR(50),
+        hds_schedule_id VARCHAR(20),
+        hds_pack_date VARCHAR(10),
+        hds_production_date VARCHAR(10),
+        hds_region VARCHAR(255),
+        hds_suburb VARCHAR(255),
+        hds_postcode VARCHAR(10),
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_order_enrichments_order_id 
+      ON order_enrichments(order_id)
+    `);
+    console.log('    ✅ order_enrichments table ready');
+
+    // Check if schedules exist
+    const schedulesResult = await client.query('SELECT COUNT(*) FROM delivery_schedules');
+    if (parseInt(schedulesResult.rows[0].count) === 0) {
+      console.log('  Inserting schedules...');
+      // Comprehensive schedules for all days of week (Mon-Fri)
+      // Each day has AM and Business Hours options
+      // Pack day is 2 days before delivery (e.g., Thursday delivery = Tuesday pack = Monday production)
+      await client.query(`
+        INSERT INTO delivery_schedules (region_id, cutoff_day, pack_day, delivery_day, hours, enabled, is_default) VALUES
+        -- Region 1 (default): Monday-Friday deliveries
+        (1, 3, 1, 1, 'AM', true, true),                -- Mon deliver, Sat pack, Fri production
+        (1, 3, 1, 1, 'Business Hours', true, false),
+        (1, 3, 2, 2, 'AM', true, true),                -- Tue deliver, Sun pack, Sat production
+        (1, 3, 2, 2, 'Business Hours', true, false),
+        (1, 3, 3, 3, 'AM', true, true),                -- Wed deliver, Mon pack, Sun production
+        (1, 3, 3, 3, 'Business Hours', true, false),
+        (1, 3, 4, 4, 'AM', true, true),                -- Thu deliver, Tue pack, Mon production
+        (1, 3, 4, 4, 'Business Hours', true, false),
+        (1, 3, 5, 5, 'AM', true, true),                -- Fri deliver, Wed pack, Tue production
+        (1, 3, 5, 5, 'Business Hours', true, false),
+        -- Region 2 (secondary): Friday deliveries
+        (2, 4, 5, 5, 'AM', true, true),
+        (2, 4, 5, 5, 'Business Hours', true, false)
+      `);
+      console.log('    ✅ Schedules inserted (Mon-Fri enabled)');
+    }
+    
+    console.log('✅ Seed data complete');
+    client.release();
+  } catch (error) {
+    console.error('❌ Seed error:', error.message);
+    client.release();
+  }
+}
+
+// Start server
+app.listen(PORT, async () => {
+  console.log(`🚀 HDS Delivery IKU Admin Backend running on port ${PORT}`);
+  console.log(`📚 API: http://localhost:${PORT}/api`);
+  
+  // Run migrations (don't crash if they fail - tables might already exist)
+  try {
+    await runMigrations();
+  await addDeliveryColumns(pool);
+  await addCasulaSuburb(pool);
+  await addCentralCoastRegion(pool);
+  } catch (error) {
+    console.error('⚠️  Migration warning:', error.message);
+    console.log('(Tables might already exist - continuing anyway)');
+  }
+  
+  // Seed initial data
+  try {
+    await seedInitialData();
+  } catch (error) {
+    console.error('⚠️  Seed warning:', error.message);
+  }
+  
+  // Test DB connection
+  try {
+    const result = await pool.query('SELECT NOW()');
+    console.log(`✅ Database connected`);
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+  }
+
+  // Initialize HDS sync jobs
+  hdsSync.initSchedule();
+  console.log('⏰ HDS sync scheduled (daily at 2 AM)');
+  
+  // Initialize order enrichment queue processor
+  queueProcessor.initQueueProcessor();
+  console.log('⏰ Order enrichment queue processor started (every 10 seconds)');
+  
+  // Initialize HDS suburbs sync job (runs daily at 3 AM)
+  hdsSuburbsSync.initSchedule();
+  console.log('⏰ HDS suburbs sync scheduled (daily at 3 AM)');
+
+  // If suburbs store is empty, load seed data
+  let suburbStats = suburbsStore.getStats();
+  if (suburbStats.total === 0) {
+    console.log('📍 Suburbs store is empty - loading seed data...');
+    const suburbsSeed = require('./lib/suburbs-seed');
+    suburbsSeed.forEach(suburb => {
+      suburbsStore.create(suburb);
+    });
+    suburbStats = suburbsStore.getStats();
+    console.log(`✅ Seed data loaded: ${suburbStats.total} suburbs ready`);
+    console.log('   Serviceable: ' + suburbStats.serviceable);
+  } else {
+    console.log(`📍 Suburbs store ready: ${suburbStats.total} suburbs`);
+  }
+});
+
+module.exports = app;
+// Force redeploy Mon Apr 14 14:11:00 AEST 2026 - 27 regions fix
+// Force rebuild Tue Jun 16 14:40:25 AEST 2026
+// Force redeploy Thu Jul  2 14:21:38 AEST 2026
+// Force rebuild Tue Jul 14 15:10:00 AEST 2026 - insert 28 regions on startup

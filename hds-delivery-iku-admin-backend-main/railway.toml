@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+
+[start]
+cmd = "node server.js"
+
+# Secrets (DATABASE_URL, HDS_API_URL, HDS_EMAIL, HDS_PASSWORD, TZ) are set in
+# Railway > Service > Variables. Do not commit them here.
