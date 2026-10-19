@@ -51,8 +51,9 @@ export default function BlackoutDates() {
 
     try {
       const response = await api.post('/blackout-dates', newBlackout)
-      // response.data.data is an array of created dates
-      const createdDates = response.data.data || []
+      // API returns the created row; accept an array too
+      const created = response.data.data
+      const createdDates = Array.isArray(created) ? created : created ? [created] : []
       setBlackoutDates([...createdDates, ...blackoutDates])
       setNewBlackout({ start_date: '', end_date: '', reason: '' })
       setShowAddForm(false)
