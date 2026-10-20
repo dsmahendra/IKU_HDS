@@ -8,6 +8,7 @@
 
 const pool = require('../lib/db');
 const suburbsStore = require('../lib/suburbs-sync-store');
+const { getShopifyToken, clearShopifyToken, getShopifyStore } = require('../lib/shopify-token');
 
 const BATCH_SIZE = 10;
 const PROCESS_INTERVAL = 10000; // 10 seconds
@@ -276,8 +277,8 @@ async function enrichOrder(deliveryDate, deliveryLocationId, deliveryTime) {
  */
 async function syncToShopifyAsync(orderId, enrichedData) {
   try {
-    const shopifyToken = process.env.SHOPIFY_ADMIN_TOKEN;
-    const shopifyStore = (process.env.SHOPIFY_STORE || '').replace(/\/$/, '');
+    const shopifyToken = await getShopifyToken();
+    const shopifyStore = getShopifyStore();
 
     if (!shopifyToken || !shopifyStore) {
       console.log('⚠️ Shopify creds missing, skipping sync');
@@ -350,7 +351,8 @@ async function syncToShopifyAsync(orderId, enrichedData) {
     console.log(`✅ Synced to Shopify #${orderId}`);
   } catch (err) {
     if (err.response?.status === 401) {
-      console.warn('⚠️ Shopify 401: Check SHOPIFY_ADMIN_TOKEN');
+      clearShopifyToken();
+      console.warn('⚠️ Shopify 401: Check SHOPIFY_ADMIN_TOKEN or SHOPIFY_CLIENT_ID/SECRET');
     } else if (err.response?.status === 404) {
       console.warn(`⚠️ Shopify 404: Order #${orderId} not found`);
     } else if (err.code === 'ECONNREFUSED') {
